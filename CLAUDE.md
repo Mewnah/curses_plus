@@ -18,7 +18,8 @@ pnpm build && pnpm preview  # static web build + serve; no native features
 pnpm typecheck           # tsc --noEmit — run before any PR
 pnpm test:e2e            # Playwright: builds then smokes / and /client (both mount #root)
 pnpm exec playwright test tests/smoke.spec.ts   # single test file
-PW_PREVIEW_ONLY=1 pnpm test:e2e                 # skip rebuild when dist/ already exists
+PW_PREVIEW_ONLY=1 pnpm test:e2e                 # skip rebuild when dist/ already exists (bash)
+# PowerShell (primary platform): $env:PW_PREVIEW_ONLY=1; pnpm test:e2e
 
 # Rust (from src-tauri/)
 cargo clippy --all-targets   # CI gate on the Rust side
@@ -31,7 +32,7 @@ node scripts/merge-http-tts-i18n.mjs   # merge new HTTP-TTS UI keys into non-EN 
 node scripts/merge-neural-i18n.mjs     # same, for neural TTS keys
 ```
 
-`@/` is aliased to `src/` (see `tsconfig.json` + `vite.config.ts`). `pnpm dev`/`pnpm build` run `scripts/sync-manual.mjs`, which copies `docs/manual/` into `public/manual/` and `public/docs/` for the in-app Help reader — edit the source under `docs/`, not the generated copies.
+`@/` is aliased to `src/` (see `tsconfig.json` + `vite.config.ts`). `pnpm dev`/`pnpm build` run `scripts/sync-manual.mjs`, which copies `docs/manual/` → `public/manual/` and, separately, the consolidated top-level guides (`docs/OPERATOR_REFERENCE.md`, `DEVELOPER_GUIDE.md`, `RELEASE_AND_ENGINEERING.md`, …) → `public/docs/` for the in-app Help reader — edit the sources under `docs/`, not the generated copies.
 
 ## Architecture
 
@@ -42,7 +43,7 @@ node scripts/merge-neural-i18n.mjs     # same, for neural TTS keys
 **Global singletons** live on `window` (declared in `src/index.tsx`): `Config`, `ApiShared`, `ApiServer` (host services), `ApiClient` (document). Code reaches services via `window.ApiServer.*`.
 
 **Three source layers** (`src/services-registry.ts` holds the `Services` enum and must not import from core/client, to break circular types):
-- `src/client/` — document, scenes, elements, files, particles, sound. **Remote-safe: never call Tauri `invoke` or import host-only modules.** This is a hard rule; clients run this code without Tauri. Legacy `audioViz` elements are stripped on load (`src/client/schema/`).
+- `src/client/` — document, scenes, elements, files, particles, sound. **Remote-safe: this code runs on clients that have no Tauri, so it must never *execute* Tauri at client runtime.** There are no `invoke()` calls here; the few `@tauri-apps` APIs some services do import (document/files/sound) must stay guarded behind `window.Config.isServer()`/`isClient()`. Legacy `audioViz` elements are stripped on load (`src/client/schema/`).
 - `src/core/` — host services (`src/core/services/<id>/`), persisted settings, Sigil chrome, `ApiServer` (`src/core/index.ts`), Zod schema (`src/core/schema.ts`).
 - `src/shared/` — PubSub bridge and Peer bridge used by both.
 
@@ -50,14 +51,14 @@ node scripts/merge-neural-i18n.mjs     # same, for neural TTS keys
 
 **Native side** (`src-tauri/`): frontend calls `invoke("plugin:<name>|<command>")`. Custom Rust plugins are in `src-tauri/src/services/` and registered in `src-tauri/src/main.rs` (osc, web, audio, whisper, vosk-stt, moonshine-stt, windows-tts, uberduck-tts, kokoro/melo/chatterbox/fish/neural-onnx/neural-sidecar TTS, translate, voice-changer, keyboard, uwu). IPC and FS access are gated by capability JSON in `src-tauri/capabilities/` (Tauri 2 model) — prefer tightening `fs:scope`/plugin permissions over broad `*:default`.
 
-**Data flow (host):** `Service_PubSub.publish` → PubSub-JS topics → `invoke("plugin:web|pubsub_broadcast")` → Rust → `emit("pubsub", …)` → JS listeners, plus PeerJS broadcast to clients. The Rust `web` plugin serves `127.0.0.1:<port>` (PeerJS signaling, pubsub WebSocket, static assets) — **localhost only**; treat any exposure beyond localhost as a high-risk change.
+**Data flow (host):** `Service_PubSub.publish` → PubSub-JS topics → `invoke("plugin:web|pubsub_broadcast")` → Rust → `emit("pubsub", …)` → JS listeners, plus PeerJS broadcast to clients. The Rust `web` plugin (`src-tauri/src/services/web/mod.rs`) binds **`0.0.0.0:<port>`** — all IPv4 interfaces, so it is reachable across the LAN, not just localhost (deliberate, matching upstream curses; a `127.0.0.1`-only bind rejected some localhost paths). It serves PeerJS signaling, the pubsub WebSocket, and static assets with **no auth/TLS**, so treat that LAN exposure as a real attack surface and any change to the bind/auth model as high-risk.
 
 ## Adding or changing a host service
 
 A service exists across three registration points that must stay in sync — miss one and TypeScript exhaustiveness checks (or runtime routing) will catch it:
 1. `Services.<id>` in `src/services-registry.ts` (if it needs a sidebar/inspector tab).
 2. `Service_*_Schema` under `BackendSchema.services` in `src/core/schema.ts`, plus `PERSISTED_SERVICE_KEYS` — **only** for persisted services. Use `window.ApiServer.patchService(key, fn)` exclusively for these keys.
-3. `ApiServer` field + `init` task in `src/core/index.ts` (`buildHostServiceInitTasks`), and a panel entry in `src/core/ui/servicePanels.tsx` (lazy inspector, nav, sidebar, title).
+3. `ApiServer` field + `init` task in `src/core/index.ts` (`getHostServiceInitTasks`), and a panel entry in `src/core/ui/servicePanels.tsx` (lazy inspector, nav, sidebar, title).
 
 Non-persisted tabs (e.g. `voice_changer`) skip step 2's schema slice — do **not** call `patchService` for them. The full checklists and the STT/TTS/translation backend wiring tables are in `docs/DEVELOPER_GUIDE.md`.
 
